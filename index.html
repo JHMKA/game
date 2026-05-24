@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pixel Night Shift</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+
+      <!-- ── 左侧：游戏画布区 ── -->
+      <section class="game-panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <p class="eyebrow">Infinite Turn Pixel Game</p>
+            <h1>Pixel Night Shift</h1>
+          </div>
+          <div class="panel-actions">
+            <button id="audioButton" class="ghost-button ghost-button--muted">声音：点击开启</button>
+            <button id="restartButton" class="ghost-button">重新开始</button>
+          </div>
+        </div>
+        <div class="board-wrap">
+          <canvas
+            id="gameCanvas"
+            width="672"
+            height="672"
+            aria-label="Pixel Night Shift game board"
+          ></canvas>
+        </div>
+      </section>
+
+      <!-- ── 右侧：HUD 面板 ── -->
+      <aside class="hud-panel">
+
+        <!-- 快速状态栏：楼层 / 回合 / 得分 -->
+        <div class="quick-bar">
+          <div class="quick-stat">
+            <span class="qs-label">楼层</span>
+            <strong class="qs-value" id="floorValue">1</strong>
+          </div>
+          <div class="qs-divider"></div>
+          <div class="quick-stat">
+            <span class="qs-label">回合</span>
+            <strong class="qs-value" id="turnValue">1</strong>
+          </div>
+          <div class="qs-divider"></div>
+          <div class="quick-stat">
+            <span class="qs-label">得分</span>
+            <strong class="qs-value qs-score" id="scoreValue">0</strong>
+          </div>
+        </div>
+
+        <!-- 生命 / 等级 / 经验 / 气候 -->
+        <section class="card card--vitals">
+          <div class="vitals-row">
+            <div class="vital-item vital-hp">
+              <span class="vital-label">生命</span>
+              <strong class="vital-value" id="hpValue">10 / 10</strong>
+            </div>
+            <div class="vital-item vital-lv">
+              <span class="vital-label">等级</span>
+              <strong class="vital-value" id="levelValue">1</strong>
+            </div>
+            <div class="vital-item vital-xp">
+              <span class="vital-label">经验</span>
+              <strong class="vital-value" id="xpValue">0 / 1</strong>
+            </div>
+            <div class="vital-item vital-climate">
+              <span class="vital-label">气候</span>
+              <strong class="vital-value" id="climateValue">薄雾</strong>
+            </div>
+          </div>
+        </section>
+
+        <!-- 战斗属性：攻击 / 护甲 / 连斩 / 状态 -->
+        <section class="card card--combat">
+          <div class="combat-grid">
+            <div class="cstat cstat--atk">
+              <span>攻击</span>
+              <strong id="attackValue">2</strong>
+            </div>
+            <div class="cstat cstat--arm">
+              <span>护甲</span>
+              <strong id="armorValue">0</strong>
+            </div>
+            <div class="cstat cstat--combo">
+              <span>连斩</span>
+              <strong id="comboValue">0</strong>
+            </div>
+            <div class="cstat cstat--status">
+              <span>状态</span>
+              <strong id="statusValue">显形</strong>
+            </div>
+          </div>
+        </section>
+
+        <!-- 事件日志 -->
+        <section class="card card--events">
+          <h2 class="card-title">事件日志</h2>
+          <p id="messageBox" class="message-box">
+            使用方向键或 WASD 移动。撞向敌人会攻击，活过更多回合。
+          </p>
+        </section>
+
+        <!-- 升级选项 -->
+        <section class="card card--upgrades">
+          <h2 class="card-title">升级强化</h2>
+          <div id="upgradePanel" class="upgrade-panel">
+            <p class="muted">击败敌人获得经验，升级时会出现三选一强化。</p>
+          </div>
+        </section>
+
+        <!-- 操作说明（折叠） -->
+        <details class="card card--rules">
+          <summary class="rules-summary">操作说明</summary>
+          <ul class="rules-list">
+            <li><kbd>WASD</kbd> / 方向键：移动</li>
+            <li>鼠标点击相邻一格怪物：近战攻击</li>
+            <li><kbd>空格</kbd>：原地等待一回合</li>
+            <li>草丛：站入可隐身，敌人失去追踪</li>
+            <li>击败敌人获得经验，按等级需求升级</li>
+            <li>清空楼层后坠入下一层，每 5 层迎战 Boss</li>
+          </ul>
+        </details>
+
+      </aside>
+    </main>
+
+    <script src="./game.js"></script>
+  </body>
+</html>

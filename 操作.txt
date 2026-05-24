@@ -1,0 +1,2 @@
+python3 -m http.server 8126
+然后打开 http://127.0.0.1:8126
