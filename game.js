@@ -1752,6 +1752,156 @@ ui.restartButton.addEventListener("click", restartGame);
 window.addEventListener("pointerdown", unlockAudio, { once: true });
 window.addEventListener("keydown", unlockAudio, { once: true });
 
+// ══════════════════════════════════════
+// 移动端触控支持
+// ══════════════════════════════════════
+
+// ── 轻震动反馈（支持 Vibration API 的设备）──
+function haptic(ms = 14) {
+  if (navigator.vibrate) {
+    navigator.vibrate(ms);
+  }
+}
+
+// ── 画布滑动 & 点击攻击 ──────────────────────────────
+let touchStartX = 0;
+let touchStartY = 0;
+let touchDrifted = false;
+const SWIPE_THRESHOLD = 30; // px，触发移动的最小位移
+
+canvas.addEventListener("touchstart", (e) => {
+  unlockAudio();
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+  touchDrifted = false;
+}, { passive: true });
+
+// touchmove：位移超过阈值时标记为"滑动中"并阻止页面滚动
+canvas.addEventListener("touchmove", (e) => {
+  const dx = Math.abs(e.touches[0].clientX - touchStartX);
+  const dy = Math.abs(e.touches[0].clientY - touchStartY);
+  if (dx > 8 || dy > 8) {
+    touchDrifted = true;
+    e.preventDefault(); // 阻止滚动
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchend", (e) => {
+  const touch = e.changedTouches[0];
+  const dx = touch.clientX - touchStartX;
+  const dy = touch.clientY - touchStartY;
+  const absDx = Math.abs(dx);
+  const absDy = Math.abs(dy);
+
+  // 阻止后续触发 synthetic click（避免与下面的 click 监听器重复处理）
+  e.preventDefault();
+
+  if (!touchDrifted || (absDx < SWIPE_THRESHOLD && absDy < SWIPE_THRESHOLD)) {
+    // ── 点击（tap）：尝试攻击相邻敌人 ──
+    if (state.awaitingUpgrade || state.gameOver || state.descending) {
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const cx = (touch.clientX - rect.left) * scaleX;
+    const cy = (touch.clientY - rect.top) * scaleY;
+    const gx = Math.floor((cx - BOARD_PADDING) / CELL_SIZE);
+    const gy = Math.floor((cy - BOARD_PADDING) / CELL_SIZE);
+    if (gx >= 0 && gx < GRID_SIZE && gy >= 0 && gy < GRID_SIZE) {
+      const enemy = getEnemyAt(gx, gy);
+      if (enemy) {
+        haptic(18);
+        performPlayerAttack(enemy);
+      }
+    }
+    return;
+  }
+
+  // ── 滑动（swipe）：按主轴方向移动 ──
+  if (absDx > absDy) {
+    haptic();
+    movePlayer(dx > 0 ? 1 : -1, 0);
+  } else {
+    haptic();
+    movePlayer(0, dy > 0 ? 1 : -1);
+  }
+}, { passive: false });
+
+// ── 虚拟 D-pad 按钮 ────────────────────────────────────
+function bindDpadBtn(id, action) {
+  const btn = document.getElementById(id);
+  if (!btn) {
+    return;
+  }
+
+  // touchstart：立即响应，无 300ms 延迟
+  btn.addEventListener("touchstart", (e) => {
+    e.preventDefault(); // 阻止 click 延迟
+    unlockAudio();
+    haptic();
+    action();
+  }, { passive: false });
+
+  // 同时保留 click 支持（桌面调试用）
+  btn.addEventListener("click", () => {
+    unlockAudio();
+    action();
+  });
+}
+
+bindDpadBtn("dpadUp",    () => movePlayer(0, -1));
+bindDpadBtn("dpadDown",  () => movePlayer(0,  1));
+bindDpadBtn("dpadLeft",  () => movePlayer(-1, 0));
+bindDpadBtn("dpadRight", () => movePlayer(1,  0));
+bindDpadBtn("dpadWait",  () => waitTurn());
+
+// ── 长按方向键：持续移动 ────────────────────────────────
+// 手指按住某方向键时每 200ms 重复触发一次
+const HOLD_DELAY = 320;   // 首次触发后的延迟
+const HOLD_REPEAT = 180;  // 之后每次重复间隔
+let holdTimer = null;
+
+function startHold(action) {
+  stopHold();
+  holdTimer = window.setTimeout(() => {
+    holdTimer = window.setInterval(() => {
+      haptic(8);
+      action();
+    }, HOLD_REPEAT);
+  }, HOLD_DELAY);
+}
+
+function stopHold() {
+  if (holdTimer !== null) {
+    window.clearTimeout(holdTimer);
+    window.clearInterval(holdTimer);
+    holdTimer = null;
+  }
+}
+
+["dpadUp", "dpadDown", "dpadLeft", "dpadRight"].forEach((id) => {
+  const btn = document.getElementById(id);
+  if (!btn) {
+    return;
+  }
+
+  const actionMap = {
+    dpadUp:    () => movePlayer(0, -1),
+    dpadDown:  () => movePlayer(0,  1),
+    dpadLeft:  () => movePlayer(-1, 0),
+    dpadRight: () => movePlayer(1,  0),
+  };
+
+  btn.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    startHold(actionMap[id]);
+  }, { passive: false });
+
+  btn.addEventListener("touchend",    stopHold, { passive: true });
+  btn.addEventListener("touchcancel", stopHold, { passive: true });
+});
+
 updateAudioButton();
 restartGame();
 requestAnimationFrame(animationLoop);
