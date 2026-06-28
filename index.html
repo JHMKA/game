@@ -3,21 +3,55 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Pixel Night Shift</title>
+    <title>像素地牢</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
+    <section id="startScreen" class="start-screen" aria-hidden="false">
+      <div class="start-screen__backdrop"></div>
+      <div class="start-screen__panel">
+        <p class="start-screen__eyebrow">Roguelike · 档案管理</p>
+        <h1 class="start-screen__title">像素地牢</h1>
+        <p class="start-screen__lead">
+          创建一个新档案，或从已有档案继续你的地牢冒险。
+        </p>
+
+        <div class="profile-form">
+          <label class="profile-label" for="profileNameInput">档案名称</label>
+          <div class="profile-form__row">
+            <input
+              id="profileNameInput"
+              class="profile-input"
+              type="text"
+              maxlength="16"
+              placeholder="例如：冒险者01"
+              autocomplete="off"
+            />
+            <button id="newProfileButton" class="primary-button">新建档案</button>
+          </div>
+          <p class="profile-hint">档案保存在浏览器本地，不会上传到服务器。按 <kbd>Esc</kbd> 可返回当前进度。</p>
+        </div>
+
+        <div class="save-list__head">
+          <h2>已有档案</h2>
+          <button id="refreshSavesButton" class="ghost-button ghost-button--compact">刷新列表</button>
+        </div>
+        <div id="saveList" class="save-list" aria-live="polite"></div>
+      </div>
+    </section>
+
     <main class="app-shell">
 
       <!-- ── 左侧：游戏画布区 ── -->
       <section class="game-panel">
         <div class="panel-head">
           <div class="panel-title">
-            <p class="eyebrow">Infinite Turn Pixel Game</p>
-            <h1>Pixel Night Shift</h1>
+            <p class="eyebrow">Roguelike · 回合制地牢探险</p>
+            <h1>像素地牢</h1>
           </div>
           <div class="panel-actions">
             <button id="audioButton" class="ghost-button ghost-button--muted">声音：点击开启</button>
+            <button id="menuButton" class="ghost-button">档案</button>
             <button id="restartButton" class="ghost-button">重新开始</button>
           </div>
         </div>
@@ -26,8 +60,28 @@
             id="gameCanvas"
             width="672"
             height="672"
-            aria-label="Pixel Night Shift game board"
+            aria-label="像素地牢游戏画布"
           ></canvas>
+        </div>
+
+        <!-- 手机端虚拟手柄（触控设备 / 小屏自动显示） -->
+        <div class="mobile-controls" id="mobileControls">
+          <div class="dpad-wrap">
+            <!-- 上 -->
+            <button class="dpad-btn dpad-up"    id="dpadUp"    aria-label="向上">▲</button>
+            <!-- 中行：左 / 等待 / 右 -->
+            <div class="dpad-row">
+              <button class="dpad-btn dpad-left"  id="dpadLeft"  aria-label="向左">◀</button>
+              <button class="dpad-btn dpad-wait"  id="dpadWait"  aria-label="等待一回合">
+                <span class="wait-icon">■</span>
+                <span class="wait-label">等待</span>
+              </button>
+              <button class="dpad-btn dpad-right" id="dpadRight" aria-label="向右">▶</button>
+            </div>
+            <!-- 下 -->
+            <button class="dpad-btn dpad-down"   id="dpadDown"  aria-label="向下">▼</button>
+          </div>
+          <p class="mobile-hint">滑动画面或按方向键移动 · 点击相邻敌人攻击</p>
         </div>
       </section>
 
@@ -52,7 +106,7 @@
           </div>
         </div>
 
-        <!-- 生命 / 等级 / 经验 / 气候 -->
+        <!-- 生命 / 等级 / 经验 / 区域 -->
         <section class="card card--vitals">
           <div class="vitals-row">
             <div class="vital-item vital-hp">
@@ -68,8 +122,8 @@
               <strong class="vital-value" id="xpValue">0 / 1</strong>
             </div>
             <div class="vital-item vital-climate">
-              <span class="vital-label">气候</span>
-              <strong class="vital-value" id="climateValue">薄雾</strong>
+              <span class="vital-label">区域</span>
+              <strong class="vital-value" id="climateValue">迷雾区</strong>
             </div>
           </div>
         </section>
@@ -119,9 +173,9 @@
             <li><kbd>WASD</kbd> / 方向键：移动</li>
             <li>鼠标点击相邻一格怪物：近战攻击</li>
             <li><kbd>空格</kbd>：原地等待一回合</li>
-            <li>草丛：站入可隐身，敌人失去追踪</li>
+            <li>阴影：站入可隐身，敌人失去追踪</li>
             <li>击败敌人获得经验，按等级需求升级</li>
-            <li>清空楼层后坠入下一层，每 5 层迎战 Boss</li>
+            <li>清空楼层后坠入下一层，每 5 层迎战守护者</li>
           </ul>
         </details>
 
