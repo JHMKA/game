@@ -1,2 +1,25 @@
-python3 -m http.server 8126
-然后打开 http://127.0.0.1:8126
+```mermaid
+flowchart TD
+    P["Prefill节点计算完整KV"] --> T{"KV交接方式"}
+
+    T -->|"Direct-to-host"| H["直接写入Decode节点<br/>CPU pinned host pool"]
+    T -->|"Staging"| G["Decode设备临时接收完整KV"]
+    G --> B["异步D2H备份到host pool"]
+    B --> H
+
+    H --> A["为请求分配固定大小<br/>device hot buffer"]
+
+    A --> D["开始Decode"]
+    D --> I["每层DSA Indexer产生top-k逻辑位置"]
+    I --> S["HiSparse检查hot buffer命中"]
+    S --> HIT["命中：返回已有物理slot"]
+    S --> MISS["未命中：选择空闲/LRU slot"]
+    MISS --> COPY["Host KV → Device hot buffer"]
+    COPY --> U["更新token标签和LRU"]
+    HIT --> ATT
+    U --> ATT["稀疏Attention读取物理hot slot"]
+    ATT --> N["生成新token KV"]
+    N --> R["写入预留device slot"]
+    R --> BACK["下一步异步备份新KV到Host"]
+    BACK --> D
+```
