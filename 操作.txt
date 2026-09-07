@@ -1,4 +1,4 @@
-可以，而且我认为**不改 HiSparse 算子本身，仍然有比较大的优化空间**。从当前 SGLang 源码看，HiSparse 已经把 host/device KV 管理集中在 `HiSparseCoordinator`，并且有独立 `prefetch_stream` 和 miss-plan 数据结构，因此很适合在 coordinator 和 scheduler 层做优化，而不用碰([GitHub][1])([GitHub][1])
+我认为**不改 HiSparse 算子本身，仍然有比较大的优化空间**。从当前 SGLang 源码看，HiSparse 已经把 host/device KV 管理集中在 `HiSparseCoordinator`，并且有独立 `prefetch_stream` 和 miss-plan 数据结构，因此很适合在 coordinator 和 scheduler 层做优化，而不用碰([GitHub][1])([GitHub][1])
 
 我最推荐把它做成下面这个组合：
 
@@ -958,33 +958,3 @@ CUDA stream/event orchestration
 | **Adaptive Prefetch Budget** |   ★★ |       **中** |           **较高** |
 | **I/O-aware Scheduler**      |  ★★★ | **大，尤其高并发** |            **高** |
 | 三者联合                         | ★★★★ |    **最值得做** |           **很高** |
-
-所以如果你的目标不仅仅是“跑快一点”，而是想做成一个**研一可以切入的系统研究点**，我最推荐的不是简单扩大 GPU buffer，而是：
-
-> **利用 sparse attention 的跨 token Top-K temporal locality，预测未来 KV residency；再由 I/O-aware scheduler 根据预测 miss cost 重组 decode batch，在不修改任何模型或 attention operator 的情况下，把 host-device I/O 从关键路径中隐藏。**
-
-这个问题非常像一个完整的论文故事：
-
-$$
-\boxed{
-\text{Sparse Attention}
-\rightarrow
-\text{Sparse KV residency}
-\rightarrow
-\text{IO bottleneck}
-\rightarrow
-\text{predictive residency}
-+
-\text{IO-aware scheduling}
-}
-$$
-
-而且它有一个非常清楚的第一步实验：**先完全不改 SGLang 行为，只统计连续 decode token 的 Top-K overlap 曲线**。如果你测出来 `S_t` 与 `S_{t+1}` 的 overlap 很高，这个方案就有非常直接的依据；如果 overlap 很低，我们就不值得往预测预取方向投入。
-
-如果你准备在 SGLang 源码上真正实现，我下一步可以直接按照现在的 `hisparse_coordinator.py` 给你设计一个**最小侵入版本**：具体指出改哪些函数、增加哪些 tensor、怎么记录 `top-k(t-1)`、在哪里发起 asynchronous prefetch，以及怎么做第一版 benchmark。
-
-[1]: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py "sglang/python/sglang/srt/managers/hisparse_coordinator.py at main · sgl-project/sglang · GitHub"
-[2]: https://arxiv.org/abs/2608.07009?utm_source=chatgpt.com "HiSparse: Scaling Sparse-Attention Decoding with Hierarchical KV Cache Management"
-[3]: https://github.com/sgl-project/sglang/issues/28874?utm_source=chatgpt.com "HiSparse Roadmap for Long-Context Sparse Serving · Issue #28874 · sgl-project/sglang · GitHub"
-[4]: https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/hisparse_guide.mdx?utm_source=chatgpt.com "sglang/docs/docs/advanced_features/hisparse_guide.mdx at main · sgl-project/sglang · GitHub"
-[5]: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py?utm_source=chatgpt.com "sglang/python/sglang/srt/model_executor/model_runner.py at main · sgl-project/sglang · GitHub"
