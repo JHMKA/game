@@ -1,25 +1,990 @@
-```mermaid
-flowchart TD
-    P["Prefill节点计算完整KV"] --> T{"KV交接方式"}
+可以，而且我认为**不改 HiSparse 算子本身，仍然有比较大的优化空间**。从当前 SGLang 源码看，HiSparse 已经把 host/device KV 管理集中在 `HiSparseCoordinator`，并且有独立 `prefetch_stream` 和 miss-plan 数据结构，因此很适合在 coordinator 和 scheduler 层做优化，而不用碰([GitHub][1])([GitHub][1])
 
-    T -->|"Direct-to-host"| H["直接写入Decode节点<br/>CPU pinned host pool"]
-    T -->|"Staging"| G["Decode设备临时接收完整KV"]
-    G --> B["异步D2H备份到host pool"]
-    B --> H
+我最推荐把它做成下面这个组合：
 
-    H --> A["为请求分配固定大小<br/>device hot buffer"]
+> **Temporal Predictive Prefetch + I/O-aware Scheduling + Adaptive Prefetch Budget**
 
-    A --> D["开始Decode"]
-    D --> I["每层DSA Indexer产生top-k逻辑位置"]
-    I --> S["HiSparse检查hot buffer命中"]
-    S --> HIT["命中：返回已有物理slot"]
-    S --> MISS["未命中：选择空闲/LRU slot"]
-    MISS --> COPY["Host KV → Device hot buffer"]
-    COPY --> U["更新token标签和LRU"]
-    HIT --> ATT
-    U --> ATT["稀疏Attention读取物理hot slot"]
-    ATT --> N["生成新token KV"]
-    N --> R["写入预留device slot"]
-    R --> BACK["下一步异步备份新KV到Host"]
-    BACK --> D
+它仍然保持：
+
+```text
+Full KV → CPU
+Hot KV  → GPU
+Top-k   → Sparse Attention
 ```
+
+完全不改变 HiSparse 的计算结果，只是尽可能让需要的 KV **在真正被 top-k 选中之前，就已经进入 GPU**。
+
+---
+
+## 1. 当前 HiSparse 为什么会慢
+
+当前最麻烦的路径是：
+
+```text
+               Decode step t
+                    │
+                 Indexer
+                    │
+                 Top-K
+                    │
+           ┌────────┴────────┐
+           │                 │
+          Hit               Miss
+           │                 │
+           │             CPU DRAM
+           │                 │
+           │               PCIe
+           │                 │
+           └──────────────→ GPU
+                             │
+                         Attention
+```
+
+如果 miss 的 KV 必须等：
+
+$$
+CPU\rightarrow GPU
+$$
+
+传完才能继续 attention，那么：
+
+$$
+T_{\text{decode}}
+=
+T_{\text{compute}}
++
+T_{\text{miss-IO}}
+$$
+
+论文的 no-I/O oracle 也表明，HiSparse 剩余的主要额外成本就是 host-device I/O，而不是它的 resolution 逻辑本身。([arXiv][2])
+
+所以真正应该做的是：
+
+$$
+T_{\text{decode}}
+=
+\max(T_{\text{compute}},T_{\text{IO}})
+$$
+
+而不是简单优化 CUDA operator。
+
+---
+
+# 2. 第一项：跨 Token 的预测预取
+
+我觉得这是最值得尝试的一项。
+
+现在 HiSparse 已经支持一种 prefetch，但主要利用的是：
+
+> 同一个 decode step，不同 layer 之间共享 index。
+
+源码明确写的是 `shared-index prefetch`：
+
+```text
+Anchor layer
+    │
+    ├── 得到 top-k
+    │
+    ├── 记录 miss plan
+    │
+    └──────────────┐
+                   │ async
+Layer N compute    │ CPU → GPU
+                   │
+                   ↓
+             shared layer N+1
+```
+
+([GitHub][1])
+
+但我们可以再利用另外一种局部性：
+
+## Temporal locality
+
+LLM 连续生成：
+
+```text
+token t
+token t+1
+token t+2
+```
+
+三个 query 通常不会完全无关。
+
+假设：
+
+```text
+step t:
+
+top-k =
+[3, 8, 25, 91, 102, 108, 351, ...]
+```
+
+而：
+
+```text
+step t+1:
+
+top-k =
+[3, 8, 25, 92, 102, 108, 351, ...]
+```
+
+如果两步 top-k 有比较高的重叠，那么我们不必等：
+
+```text
+step t+1 Indexer
+        ↓
+      miss
+        ↓
+CPU → GPU
+```
+
+而是在 step t 结束以后直接预测：
+
+```text
+S(t+1) ≈ S(t)
+```
+
+提前搬。
+
+---
+
+# 3. 不要简单地把上一轮 Top-K 全搬过去
+
+这会浪费 PCIe。
+
+我会做一个 **Top-K Stability Predictor**。
+
+对每个 request、每个 anchor layer 记录最近几步：
+
+$$
+S_t,S_{t-1},S_{t-2}
+$$
+
+首先计算 top-k 保留率：
+
+$$
+R_t=
+\frac{|S_t\cap S_{t-1}|}{K}
+$$
+
+例如：
+
+```text
+K = 2048
+
+两次相同 = 1700
+
+R = 1700 / 2048
+  = 83%
+```
+
+这意味着：
+
+> 上一轮 Top-K 对下一轮具有很强预测能力。
+
+反过来：
+
+```text
+R = 20%
+```
+
+说明索引变化很剧烈。
+
+这种 request 就没必要浪费 PCIe 进行 aggressive prefetch。
+
+---
+
+# 4. 自适应决定“预取多少”
+
+因此增加：
+
+```text
+prefetch_budget
+```
+
+例如：
+
+$$
+P_t=P_{\max}\cdot R_t
+$$
+
+假设：
+
+```text
+top_k = 2048
+Pmax  = 1024
+```
+
+### 稳定 request
+
+```text
+R = 0.9
+
+prefetch ≈ 922 KV
+```
+
+### 不稳定 request
+
+```text
+R = 0.2
+
+prefetch ≈ 205 KV
+```
+
+甚至：
+
+```text
+R < 0.15
+
+prefetch = 0
+```
+
+这样避免出现一个很典型的问题：
+
+```text
+错误预测
+   ↓
+搬了一堆 KV
+   ↓
+PCIe bandwidth 被占用
+   ↓
+还挤掉 GPU 里的 hot KV
+   ↓
+真正 Top-K 来了以后又 miss
+```
+
+也就是所谓的：
+
+> **prefetch pollution**
+
+---
+
+# 5. 再进一步：不要只看上一轮
+
+可以维护一个很轻量的历史热度。
+
+例如：
+
+$$
+Score(i)=
+1.0I(i\in S_t)
++
+0.5I(i\in S_{t-1})
++
+0.25I(i\in S_{t-2})
+$$
+
+于是：
+
+```text
+token 100
+最近三次都被选中
+Score = 1.75
+
+token 523
+只有这一次被选中
+Score = 1.0
+```
+
+优先预取：
+
+```text
+高 score
+    ↓
+GPU
+```
+
+而不是：
+
+```text
+全部上一轮 Top-K
+    ↓
+GPU
+```
+
+这里甚至**不需要 indexer 给你 probability / score**。
+
+只记录：
+
+```text
+top-k token IDs
+```
+
+就够了。
+
+所以不用改 indexer。
+
+---
+
+# 6. 最重要的一点：预测错了也不会改变模型结果
+
+这是这个方案比较漂亮的地方。
+
+我们只是提前改变 KV 的：
+
+> residence / placement
+
+并没有改变：
+
+```text
+Indexer Top-K
+Attention
+KV value
+```
+
+比如我们预测：
+
+```text
+A B C D
+```
+
+实际需要：
+
+```text
+A B E F
+```
+
+那么：
+
+```text
+A B → Hit
+
+E F → 原始 HiSparse miss-resolution
+       CPU → GPU
+```
+
+最终计算的依然是：
+
+```text
+A B E F
+```
+
+所以：
+
+$$
+Output_{\text{optimized}}
+=
+Output_{\text{HiSparse}}
+$$
+
+属于 **exact optimization**。
+
+---
+
+# 7. 第二项：Two-Microbatch I/O Overlap
+
+不过单纯 temporal prefetch 还不够。
+
+真正比较大的优化可以是：
+
+> 把 decode batch 分成两个 microbatch。
+
+例如原本：
+
+```text
+Batch = 64 requests
+```
+
+改成：
+
+```text
+A = 32 requests
+B = 32 requests
+```
+
+然后：
+
+```text
+时间 ──────────────────────────────→
+
+Compute stream:
+
+        Compute A
+                    Compute B
+                                Compute A
+                                           Compute B
+
+
+Prefetch stream:
+
+        Prefetch B
+                    Prefetch A
+                                Prefetch B
+```
+
+即：
+
+```text
+              GPU Compute
+                  │
+                  │
+           ┌──────┴──────┐
+           │             │
+        Batch A        Batch B
+           │             │
+           │             │
+           ↓             ↓
+
+t1:   Compute A  ||  Prefetch B
+
+t2:   Compute B  ||  Prefetch A(next)
+
+t3:   Compute A  ||  Prefetch B(next)
+```
+
+于是原来的：
+
+$$
+T=C+I
+$$
+
+理想情况下变成：
+
+$$
+T\approx\max(C,I)
+$$
+
+---
+
+# 8. 举一个很直观的数字
+
+假设目前：
+
+```text
+GPU compute      = 800 μs
+HiSparse H2D IO  = 400 μs
+```
+
+现在：
+
+$$
+T=800+400=1200\mu s
+$$
+
+如果实现 overlap：
+
+```text
+Compute
+████████████████████
+
+IO
+██████████
+```
+
+重叠：
+
+```text
+Compute
+████████████████████
+
+IO
+██████████
+```
+
+就有可能变成：
+
+$$
+T\approx800\sim900\mu s
+$$
+
+而不是 1200 μs。
+
+换句话说，TPOT 理论上可能从：
+
+```text
+1.2 ms
+
+↓
+
+~0.85-0.95 ms
+```
+
+当然实际提升多少需要实测 PCIe 利用率和 overlap window。
+
+---
+
+# 9. 但 Two-Batch Overlap 本身不能作为主要创新
+
+这一点要特别提醒你。
+
+当前 SGLang HiSparse roadmap 已经明确列出了：
+
+> “Support TwoBatch Overlap to hide IO latency”
+
+同时也已经在做：
+
+> IndexShared based IO prefetch + compute overlap。([GitHub][3])
+
+因此如果你以后是想：
+
+> **基于这个东西做一个论文工作**
+
+我不会把：
+
+```text
+async memcpy
++
+two batch
+```
+
+当核心贡献。
+
+它更适合作为你的 baseline optimization。
+
+---
+
+# 10. 第三项才是比较有研究价值的：I/O-aware Scheduler
+
+这是我更看好的方向。
+
+传统 scheduler 主要考虑：
+
+```text
+token 数
+batch size
+KV capacity
+```
+
+但是对于 HiSparse，两个 batch 即使：
+
+```text
+batch size = 32
+```
+
+实际耗时也可能完全不一样。
+
+### Batch A
+
+```text
+cache hit rate = 95%
+```
+
+只需要搬：
+
+```text
+很少 KV
+```
+
+### Batch B
+
+```text
+cache hit rate = 50%
+```
+
+需要大量：
+
+```text
+CPU → GPU
+```
+
+于是：
+
+```text
+Batch A = compute bound
+Batch B = IO bound
+```
+
+传统 scheduler 看不出来这个区别。
+
+---
+
+# 11. 给每个 request 建一个 I/O cost
+
+例如维护 EMA：
+
+$$
+m_r^{(t)}
+=
+\alpha m_r^{(t-1)}
++
+(1-\alpha)\frac{\text{miss}}{K}
+$$
+
+那么预测这个 request 下一步产生的 H2D：
+
+$$
+IO_r
+=
+m_rK\times Bytes_{KV}\times L
+$$
+
+其中：
+
+* \(m_r\)：预测 miss rate
+* \(K\)：top-k
+* \(Bytes_{KV}\)：每个 KV entry 大小
+* \(L\)：相关 sparse layers 数量
+
+于是 scheduler 不只是看到：
+
+```text
+request 1
+request 2
+request 3
+```
+
+而会看到：
+
+```text
+Req A   predicted IO = 2 MB
+Req B   predicted IO = 18 MB
+Req C   predicted IO = 3 MB
+Req D   predicted IO = 16 MB
+```
+
+---
+
+# 12. 然后做 High-I/O / Low-I/O 配对
+
+不要：
+
+```text
+Batch 1:
+B + D + F + H
+全是 high miss
+```
+
+因为这样瞬间把 PCIe 吃满。
+
+而是：
+
+```text
+Batch 1:
+
+High IO
+Low IO
+High IO
+Low IO
+```
+
+让每个 batch 的：
+
+$$
+\sum IO_r
+$$
+
+尽量接近。
+
+例如：
+
+```text
+before
+
+Batch A = 80 MB
+Batch B = 15 MB
+Batch C = 75 MB
+Batch D = 20 MB
+```
+
+变成：
+
+```text
+after
+
+Batch A = 46 MB
+Batch B = 48 MB
+Batch C = 49 MB
+Batch D = 47 MB
+```
+
+这样能够减少：
+
+```text
+PCIe burst
+↓
+transfer queue
+↓
+tail latency
+```
+
+---
+
+# 13. 可以再设置一个 PCIe Budget
+
+例如实时测出：
+
+$$
+BW_{\text{H2D}}=50GB/s
+$$
+
+允许一个 decode step 最多用于 IO：
+
+$$
+T_{IO,target}=300\mu s
+$$
+
+则：
+
+$$
+Budget
+=
+50GB/s\times300\mu s
+\approx15MB
+$$
+
+scheduler 就控制：
+
+$$
+\sum_{r\in Batch}PredictedIO_r
+\leq Budget
+$$
+
+变成：
+
+> **I/O-aware continuous batching**
+
+这比单纯改变 `device_buffer_size` 有意思得多。
+
+---
+
+# 14. 第四项：自适应 Prefetch，不是越多越好
+
+这里还可以增加一个 feedback controller。
+
+实时记录：
+
+```text
+prefetch_hit_rate
+miss_rate
+H2D bandwidth
+GPU utilization
+prefetch waste
+```
+
+定义：
+
+$$
+Accuracy_{prefetch}
+=
+\frac{\text{prefetched and actually used}}
+{\text{prefetched}}
+$$
+
+例如：
+
+```text
+prefetch accuracy > 80%
+```
+
+说明预测很好：
+
+```text
+prefetch_budget ↑
+```
+
+如果：
+
+```text
+accuracy < 30%
+```
+
+就：
+
+```text
+prefetch_budget ↓
+```
+
+如果 PCIe 已经：
+
+```text
+> 85% utilization
+```
+
+也应该：
+
+```text
+prefetch_budget ↓
+```
+
+因此形成：
+
+```text
+               runtime statistics
+                       │
+        ┌──────────────┼─────────────┐
+        ↓              ↓             ↓
+    miss rate     prediction       PCIe BW
+                    accuracy
+        │              │             │
+        └──────────────┼─────────────┘
+                       ↓
+             Prefetch Controller
+                       ↓
+                prefetch budget
+```
+
+---
+
+# 15. 与 `device_buffer_size` 联动
+
+当前 HiSparse 配置里本身有：
+
+```text
+top_k
+device_buffer_size
+host_to_device_ratio
+swap_in_block_size
+```
+
+官方示例甚至给的是：
+
+```text
+top_k = 2048
+
+device_buffer_size = 6144
+```
+
+([GitHub][4])
+
+源码中对于长序列，请求会受到这个 `device_buffer_size` 上限约束，并维护 per-request 的设备 buffer 和 LRU 元数据。([GitHub][1])
+
+所以我们还可以做一个**启动时 auto tuner**：
+
+```text
+top_k = 2048
+
+候选：
+4096
+5120
+6144
+7168
+8192
+```
+
+分别跑几十个 decode step。
+
+测：
+
+$$
+Cost(B)
+=
+TPOT(B)+\lambda Memory(B)
+$$
+
+自动选择：
+
+```text
+device_buffer_size*
+```
+
+而不是人工写死：
+
+```bash
+"device_buffer_size": 4096
+```
+
+这一项实现非常简单，可以作为工程补充，但不适合作为主要创新。
+
+---
+
+# 16. 最后整个系统会变成这样
+
+我建议最终架构：
+
+```text
+                    Request
+                       │
+                       ↓
+              ┌────────────────┐
+              │ IO-aware       │
+              │ Scheduler      │
+              └───────┬────────┘
+                      │
+                Batch A / B
+                      │
+          ┌───────────┴────────────┐
+          │                        │
+          ↓                        ↓
+    Compute Stream            Prefetch Stream
+          │                        │
+          │                 Temporal Predictor
+          │                        │
+          │                  predicted Top-K
+          │                        │
+          │                    CPU → GPU
+          │                        │
+          └───────────┬────────────┘
+                      ↓
+                HiSparse Cache
+                      │
+                  Indexer
+                      │
+                  actual Top-K
+                      │
+             ┌────────┴────────┐
+             ↓                 ↓
+            HIT               MISS
+             │                 │
+             │          Original HiSparse
+             │            CPU → GPU
+             └────────┬────────┘
+                      ↓
+              Sparse Attention
+```
+
+**最底下的：**
+
+```text
+Indexer
+HiSparse resolve kernel
+Sparse attention operator
+```
+
+全部不用改。
+
+你改的是：
+
+```text
+HiSparseCoordinator
+Scheduler
+CUDA stream/event orchestration
+少量历史 metadata
+```
+
+而 SGLang 当前确实已经把 HiSparse coordinator 独立出来，并在 model runner 初始化时将 `device_buffer_size`、`host_to_device_ratio` 等交给 coordinator，非常适合从这里插入机制。([GitHub][5])
+
+---
+
+## 如果让我实际做，我会按这个顺序
+
+| 优化                           |   难度 |        预期效果 |             论文价值 |
+| ---------------------------- | ---: | ----------: | ---------------: |
+| NUMA / pinned memory 调优      |    ★ |         小~中 |                低 |
+| device buffer auto-tuning    |    ★ |           中 |                低 |
+| Shared-index prefetch        |   已有 |           中 |               很低 |
+| Two-batch overlap            |   ★★ |         中~大 | 较低，官方 roadmap 已有 |
+| **Temporal Top-K Predictor** |   ★★ |     **中~大** |           **较高** |
+| **Adaptive Prefetch Budget** |   ★★ |       **中** |           **较高** |
+| **I/O-aware Scheduler**      |  ★★★ | **大，尤其高并发** |            **高** |
+| 三者联合                         | ★★★★ |    **最值得做** |           **很高** |
+
+所以如果你的目标不仅仅是“跑快一点”，而是想做成一个**研一可以切入的系统研究点**，我最推荐的不是简单扩大 GPU buffer，而是：
+
+> **利用 sparse attention 的跨 token Top-K temporal locality，预测未来 KV residency；再由 I/O-aware scheduler 根据预测 miss cost 重组 decode batch，在不修改任何模型或 attention operator 的情况下，把 host-device I/O 从关键路径中隐藏。**
+
+这个问题非常像一个完整的论文故事：
+
+$$
+\boxed{
+\text{Sparse Attention}
+\rightarrow
+\text{Sparse KV residency}
+\rightarrow
+\text{IO bottleneck}
+\rightarrow
+\text{predictive residency}
++
+\text{IO-aware scheduling}
+}
+$$
+
+而且它有一个非常清楚的第一步实验：**先完全不改 SGLang 行为，只统计连续 decode token 的 Top-K overlap 曲线**。如果你测出来 `S_t` 与 `S_{t+1}` 的 overlap 很高，这个方案就有非常直接的依据；如果 overlap 很低，我们就不值得往预测预取方向投入。
+
+如果你准备在 SGLang 源码上真正实现，我下一步可以直接按照现在的 `hisparse_coordinator.py` 给你设计一个**最小侵入版本**：具体指出改哪些函数、增加哪些 tensor、怎么记录 `top-k(t-1)`、在哪里发起 asynchronous prefetch，以及怎么做第一版 benchmark。
+
+[1]: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py "sglang/python/sglang/srt/managers/hisparse_coordinator.py at main · sgl-project/sglang · GitHub"
+[2]: https://arxiv.org/abs/2608.07009?utm_source=chatgpt.com "HiSparse: Scaling Sparse-Attention Decoding with Hierarchical KV Cache Management"
+[3]: https://github.com/sgl-project/sglang/issues/28874?utm_source=chatgpt.com "HiSparse Roadmap for Long-Context Sparse Serving · Issue #28874 · sgl-project/sglang · GitHub"
+[4]: https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/hisparse_guide.mdx?utm_source=chatgpt.com "sglang/docs/docs/advanced_features/hisparse_guide.mdx at main · sgl-project/sglang · GitHub"
+[5]: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py?utm_source=chatgpt.com "sglang/python/sglang/srt/model_executor/model_runner.py at main · sgl-project/sglang · GitHub"
